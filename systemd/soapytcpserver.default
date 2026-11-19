@@ -1,0 +1,10 @@
+# Options for SoapyTCPServer, see `SoapyTCPServer --help`.
+#
+# Listen on all interfaces with a 250ms buffer:
+SOAPYTCPSERVER_OPTS="-l 0.0.0.0 -b 250"
+#
+# Shared secret clients must present. Uncomment and choose your own, and keep
+# this file readable by root only:  sudo chmod 600 /etc/default/soapytcpserver
+# NB: the secret and the sample data are NOT encrypted on the wire, so on an
+# untrusted network tunnel the port over SSH or a VPN as well.
+#SOAPY_TCPREMOTE_KEY=change-me-to-a-long-random-string

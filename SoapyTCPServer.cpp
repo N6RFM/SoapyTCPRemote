@@ -18,6 +18,24 @@
 #include <sys/ioctl.h>
 #include <netdb.h>
 #include <unordered_set>
+#include <vector>
+#include <map>
+#include <string>
+#include <algorithm>
+#include <errno.h>
+#include <fcntl.h>
+#include <time.h>
+#include <stdlib.h>
+#include <string.h>
+#include <arpa/inet.h>
+
+// Runtime configuration (see usage())
+static std::string s_key;         // shared secret, empty = no authentication
+static int s_bufferMs = 0;        // target network buffering in ms, 0 = legacy 10 x MTU
+static const int HANDSHAKE_TIMEOUT_S = 5;   // time allowed to identify a new connection
+static const int SOCKET_RCVTIMEO_S = 10;    // max time a peer may stall mid-request
+static const int ORPHAN_DATA_TIMEOUT_S = 30; // data connections never bound to a stream
+static const size_t MAX_PENDING = 64;
 
 struct pipebuf_t {
     void *buf;
@@ -29,7 +47,7 @@ struct pipebuf_t {
 struct ConnectionInfo
 {
 // default constructor clears all values
-    ConnectionInfo(): rpc(nullptr), dev(nullptr), netSock(0), netPipe(nullptr), direction(0), stream(nullptr), pid(0), log(nullptr), level(SOAPY_SDR_INFO) {}
+    ConnectionInfo(): rpc(nullptr), dev(nullptr), netSock(0), netPipe(nullptr), direction(0), stream(nullptr), pid(0), created(0), log(nullptr), level(SOAPY_SDR_INFO) {}
 // RPC connection bits
     // NB: existance of an rpc object implies this is an RPC connection, otherwise data stream
     SoapyRPC *rpc;
@@ -52,6 +70,8 @@ struct ConnectionInfo
     SoapySDR::Stream *stream;
     // thread ID (for data pump)
     volatile pthread_t pid;
+    // creation time, used to expire data connections that are never set up
+    time_t created;
 // log stream bits
     FILE *log;
     SoapySDRLogLevel level;
@@ -59,6 +79,8 @@ struct ConnectionInfo
 
 pipebuf_t *newpipe(int size) {
     pipebuf_t *pipe = (pipebuf_t *)malloc(sizeof(pipebuf_t)+size);
+    if (!pipe)
+        return nullptr;
     pipe->buf = pipe+1;
     pipe->len = size;
     pipe->in = pipe->out = 0;
@@ -66,6 +88,32 @@ pipebuf_t *newpipe(int size) {
     pthread_cond_init(&pipe->rd, NULL);
     pthread_cond_init(&pipe->wr, NULL);
     return pipe;
+}
+
+void freepipe(pipebuf_t *pipe) {
+    if (!pipe)
+        return;
+    pthread_mutex_destroy(&pipe->mutex);
+    pthread_cond_destroy(&pipe->rd);
+    pthread_cond_destroy(&pipe->wr);
+    free(pipe);
+}
+
+// bulk copies into/out of the ring buffer (at most two memcpy each)
+static void pipecopyin(pipebuf_t *pipe, const char *src, int n) {
+    int first = std::min(n, pipe->len - pipe->in);
+    memcpy((char *)pipe->buf + pipe->in, src, first);
+    if (n > first)
+        memcpy(pipe->buf, src + first, n - first);
+    pipe->in = (pipe->in + n) % pipe->len;
+}
+
+static void pipecopyout(pipebuf_t *pipe, char *dst, int n) {
+    int first = std::min(n, pipe->len - pipe->out);
+    memcpy(dst, (char *)pipe->buf + pipe->out, first);
+    if (n > first)
+        memcpy(dst + first, pipe->buf, n - first);
+    pipe->out = (pipe->out + n) % pipe->len;
 }
 
 // blocking/failing write, allows thread switching
@@ -96,15 +144,8 @@ int pipewrite(void *src, int sz, int num, pipebuf_t *pipe, bool block = true) {
     // calculate how many items of sz will fit (up to num)
     int ft = av/sz;
     if (ft>num) ft=num;
-    // in bytes..
-    int by = ft*sz;
     // move those bytes!
-    char *p = (char *)src;
-    while (by--) {
-        ((char *)pipe->buf)[pipe->in++]=*p++;
-        if (pipe->in>=pipe->len)
-            pipe->in=0;
-    }
+    pipecopyin(pipe, (const char *)src, ft*sz);
     // assign return value = number of items written
     rv = ft;
     // release access under all exit conditions
@@ -140,15 +181,8 @@ int piperead(void *dst, int sz, int num, pipebuf_t *pipe, bool block = true) {
     // calculate how many items of sz are in the pipe (up to num)
     int nm = us/sz;
     if (nm>num) nm=num;
-    // in bytes..
-    int by = nm*sz;
     // move those bytes!
-    char *p = (char *)dst;
-    while (by--) {
-        *p++ = ((char *)pipe->buf)[pipe->out++];
-        if (pipe->out>=pipe->len)
-            pipe->out=0;
-    }
+    pipecopyout(pipe, (char *)dst, nm*sz);
     // assign return value = number of items read
     rv = nm;
     // release access under all exit conditions
@@ -160,9 +194,19 @@ int piperead(void *dst, int sz, int num, pipebuf_t *pipe, bool block = true) {
 
 static std::map<int, ConnectionInfo> s_connections;
 
+// bound how long a peer can stall us part way through a request
+static void setSockTimeout(int sock, int secs) {
+    struct timeval tv;
+    tv.tv_sec = secs;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
 int createRpc(int sock) {
     SoapySDR_log(SOAPY_SDR_DEBUG, "createRpc()");
     ConnectionInfo conn;
+    soapyNoDelay(sock);
+    setSockTimeout(sock, SOCKET_RCVTIMEO_S);
     conn.rpc = new SoapyRPC(sock);
     conn.log = nullptr;     // ensure we aren't treated as LOG stream
     // read driver and args..
@@ -222,12 +266,17 @@ int createData(int sock, int type) {
     conn.rpc = nullptr;     // ensure we aren't treated as RPC stream
     conn.log = nullptr;     // ensure we aren't treated as LOG stream
     conn.netSock = sock;
+    conn.created = time(nullptr);
     // all good - add to map and respond with map key
     // NB: we write to raw socket as stdio stream may be read-only..
+    char id[16];
+    int ilen = snprintf(id, sizeof(id), "%d\n", sock);
+    if (write(sock, id, ilen)!=ilen) {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "createData: failed to send id: %s", strerror(errno));
+        close(sock);
+        return -1;
+    }
     s_connections[sock] = conn;
-    char id[10];
-    int ilen = sprintf(id,"%d\n",sock);
-    write(sock, id, ilen);
     SoapySDR_logf(SOAPY_SDR_INFO, "New data connection: %d", sock);
     return 0;
 }
@@ -239,11 +288,18 @@ int createLog(int sock) {
     ConnectionInfo conn;
     conn.rpc = nullptr;     // ensure we aren't treated as RPC stream
     conn.netSock = sock;
+    soapyNoDelay(sock);
+    setSockTimeout(sock, SOCKET_RCVTIMEO_S);
     conn.log = fdopen(sock, "r+");
+    if (!conn.log) {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "createLog: fdopen: %s", strerror(errno));
+        close(sock);
+        return -1;
+    }
     setlinebuf(conn.log);
     // read log level from client
     int level = (SoapySDRLogLevel)SOAPY_SDR_INFO;
-    char buf[10];
+    char buf[16];
     if(!fgets(buf, sizeof(buf), conn.log)) {
         SoapySDR_logf(SOAPY_SDR_ERROR, "fgets() on log stream: %s", strerror(errno));
         fclose(conn.log);
@@ -263,6 +319,20 @@ long tsdiff(struct timespec *t1, struct timespec *t2) {
     r += (t2->tv_nsec-t1->tv_nsec)/1000;
     return r;
 }
+// Size of the inter-thread pipe: by default 10 x the read size (copes with TCP
+// jitter), or enough for -b <ms> of samples at the current sample rate.
+static size_t pipeSizeFor(ConnectionInfo *conn, size_t frameBytes, size_t readSize) {
+    size_t sz = readSize * 10;
+    if (s_bufferMs > 0 && !conn->channels.empty()) {
+        double rate = conn->dev->getSampleRate(conn->direction, conn->channels.at(0));
+        if (rate > 0) {
+            size_t want = (size_t)(rate * s_bufferMs / 1000.0) * frameBytes;
+            sz = std::max(want, readSize * 2);
+        }
+    }
+    return sz;
+}
+
 void *netPump(void *ctx) {
     ConnectionInfo *conn = (ConnectionInfo *)ctx;
     // you had 1 job... read that pipe and stuff down network
@@ -313,7 +383,7 @@ void *dataPump(void *ctx) {
         // make the network output pipe (10x MTU for jitter buffering)
         size_t fSize = g_frameSizes.at(conn->format);
         size_t mtu = conn->dev->getStreamMTU(conn->stream);
-        size_t pipeSize = mtu * fSize * 10;
+        size_t pipeSize = pipeSizeFor(conn, fSize, mtu * fSize);
         conn->netPipe = newpipe(pipeSize);
         // start network pump, unless asked to use direct write
         bool bDirect = nullptr!=getenv("SOAPY_TCPREMOTE_DIRECT_WRITE");
@@ -354,7 +424,8 @@ void *dataPump(void *ctx) {
             pipewrite((void *)".", 1, 1, conn->netPipe, false);
             pthread_join(fpid, nullptr);
         }
-        free(conn->netPipe);
+        freepipe(conn->netPipe);
+        conn->netPipe = nullptr;
         // stop the byte flood :=)
         conn->dev->deactivateStream(conn->stream);
         SoapySDR_logf(SOAPY_SDR_DEBUG, "dataPump: stop: %d", conn->netSock);
@@ -370,7 +441,7 @@ void *dataPump(void *ctx) {
         size_t chnSize = numElems * fSize;
         size_t readSize = chnSize * numChans;
         // inter-thread pipe large enough to hold 10xMTU, should cope with TCP jitter
-        size_t pipeSize = readSize * 10;
+        size_t pipeSize = pipeSizeFor(conn, elemSize, readSize);
         // allocate buffers & pointers to them
         void *buffs[numChans];
         uint8_t cbuf[readSize];
@@ -449,7 +520,8 @@ void *dataPump(void *ctx) {
         // final write to ensure netPump wakes up and terminates
         pipewrite(pbuf, elemSize, 1, conn->netPipe, false);
         pthread_join(fpid, nullptr);
-        free(conn->netPipe);
+        freepipe(conn->netPipe);
+        conn->netPipe = nullptr;
     } else {
         // TODO:XXX:
         SoapySDR_log(SOAPY_SDR_ERROR, "dataPump: unimplemented data receive funtion :=(");
@@ -460,41 +532,149 @@ void *dataPump(void *ctx) {
     return nullptr;
 }
 
-int handleListen(struct pollfd *pfd) {
-    // oops before expected..
-    if (pfd->revents & (POLLERR|POLLHUP)) {
-        SoapySDR_log(SOAPY_SDR_ERROR,"EOF or error in listen socket");
-        return -1;
+// Connections that have been accepted but have not yet told us what they are.
+// The first line sent is "<type>" or "<type>:<key>" (the key is only needed
+// when the server was started with one). We read it without ever blocking
+// the main loop, and drop peers that take too long.
+struct PendingConn {
+    std::string line;
+    time_t since;
+};
+static std::map<int, PendingConn> s_pending;
+
+// compare secrets without leaking where they differ
+static bool keyMatches(const std::string &a, const std::string &b) {
+    unsigned char diff = (a.length() != b.length());
+    size_t n = std::min(a.length(), b.length());
+    for (size_t i=0; i<n; ++i)
+        diff |= (unsigned char)(a[i] ^ b[i]);
+    return diff == 0;
+}
+
+static void dropPending(int sock) {
+    s_pending.erase(sock);
+    close(sock);
+}
+
+// accept a new connection and park it until it identifies itself.
+// Per-client failures are never fatal for the server.
+static void acceptConnection(int lsock) {
+    struct sockaddr_storage addr;
+    socklen_t len = sizeof(addr);
+    int sock = accept(lsock, (struct sockaddr *)&addr, &len);
+    if (sock<0) {
+        SoapySDR_logf(SOAPY_SDR_WARNING,"error accepting connection: %s", strerror(errno));
+        return;
     }
-    // connect pending
-    if (pfd->revents & POLLIN) {
-        struct sockaddr addr;
-        socklen_t len = sizeof(addr);
-        int sock = accept(pfd->fd, &addr, &len);
-        if (sock<0) {
-            SoapySDR_logf(SOAPY_SDR_ERROR,"error accepting connection: %s", strerror(errno));
-            return -1;
-        }
-        // now we read an integer which types the connection
-        char buf[2];
-        if (read(sock, buf, 2)<=0) {
-            SoapySDR_logf(SOAPY_SDR_ERROR,"error reading connection type: %s", strerror(errno));
+    if (s_pending.size()>=MAX_PENDING) {
+        SoapySDR_log(SOAPY_SDR_WARNING, "too many unidentified connections, dropping new one");
+        close(sock);
+        return;
+    }
+    int fl = fcntl(sock, F_GETFL, 0);
+    if (fl<0 || fcntl(sock, F_SETFL, fl|O_NONBLOCK)<0) {
+        close(sock);
+        return;
+    }
+    PendingConn pc;
+    pc.since = time(nullptr);
+    s_pending[sock] = pc;
+}
+
+// the type line is complete: authenticate and create the right kind of connection
+static void identifyConnection(int sock, const std::string &line) {
+    // back to blocking mode for the stdio based protocol handlers
+    int fl = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, fl & ~O_NONBLOCK);
+    if (line.empty() || !isdigit((unsigned char)line[0]) || (line.length()>1 && line[1]!=':')) {
+        SoapySDR_log(SOAPY_SDR_ERROR, "malformed connection type, dropping");
+        close(sock);
+        return;
+    }
+    int type = line[0]-'0';
+    if (!s_key.empty()) {
+        std::string key = line.length()>2? line.substr(2): std::string();
+        if (!keyMatches(key, s_key)) {
+            SoapySDR_log(SOAPY_SDR_WARNING, "connection rejected: missing or incorrect key");
             close(sock);
-            return -1;
+            return;
         }
-        int type = buf[0]-'0';
-        // create appropriate ConnectionInfo and insert into map..
-        if (TCPREMOTE_RPC_LOAD==type)
-            return createRpc(sock);
-        else if (TCPREMOTE_LOG_STREAM==type)
-            return createLog(sock);
-        else if (TCPREMOTE_DATA_SEND==type || TCPREMOTE_DATA_RECV==type)
-            return createData(sock, type);
-        // ..or drop it as unknown.
+    }
+    int rv = -1;
+    if (TCPREMOTE_RPC_LOAD==type)
+        rv = createRpc(sock);
+    else if (TCPREMOTE_LOG_STREAM==type)
+        rv = createLog(sock);
+    else if (TCPREMOTE_DATA_SEND==type || TCPREMOTE_DATA_RECV==type)
+        rv = createData(sock, type);
+    else {
         SoapySDR_logf(SOAPY_SDR_ERROR, "unknown connection type: %d", type);
         close(sock);
     }
-    return 0;
+    // NB: the create...() functions close the socket themselves on failure
+    (void)rv;
+}
+
+// data is available on a pending connection: collect the type line, a byte at a time
+static void handlePending(int sock) {
+    auto it = s_pending.find(sock);
+    if (it==s_pending.end())
+        return;
+    while (true) {
+        char c;
+        ssize_t n = recv(sock, &c, 1, 0);
+        if (n==0) {
+            dropPending(sock);
+            return;
+        }
+        if (n<0) {
+            if (errno==EAGAIN || errno==EWOULDBLOCK)
+                return;     // wait for more
+            if (errno==EINTR)
+                continue;
+            dropPending(sock);
+            return;
+        }
+        if (c=='\n') {
+            std::string line = it->second.line;
+            s_pending.erase(it);
+            if (!line.empty() && line.back()=='\r')
+                line.pop_back();
+            identifyConnection(sock, line);
+            return;
+        }
+        it->second.line += c;
+        if (it->second.line.length()>256) {
+            SoapySDR_log(SOAPY_SDR_WARNING, "connection type line too long, dropping");
+            dropPending(sock);
+            return;
+        }
+    }
+}
+
+// discard peers that never identified themselves, and data connections that
+// were never attached to a stream (client died between connect and setup)
+static void expireConnections() {
+    time_t now = time(nullptr);
+    std::vector<int> old;
+    for (auto &kv : s_pending)
+        if (now - kv.second.since > HANDSHAKE_TIMEOUT_S)
+            old.push_back(kv.first);
+    for (int fd : old) {
+        SoapySDR_log(SOAPY_SDR_WARNING, "unidentified connection timed out");
+        dropPending(fd);
+    }
+    old.clear();
+    for (auto &kv : s_connections) {
+        ConnectionInfo &ci = kv.second;
+        if (!ci.rpc && !ci.log && !ci.dev && ci.created && now - ci.created > ORPHAN_DATA_TIMEOUT_S)
+            old.push_back(kv.first);
+    }
+    for (int fd : old) {
+        SoapySDR_logf(SOAPY_SDR_WARNING, "unused data connection timed out: %d", fd);
+        s_connections.erase(fd);
+        close(fd);
+    }
 }
 
 int handleGetHardwareKey(ConnectionInfo &conn) {
@@ -622,6 +802,15 @@ int handleSetupStream(ConnectionInfo &conn) {
         nxt = chans.find(' ',cur);
         channels.push_back(atoi(chans.substr(cur, nxt-cur).c_str()));
     } while (nxt!=std::string::npos);
+    // channels must exist on this device
+    size_t nchan = conn.dev->getNumChannels(direction);
+    for (size_t c : channels) {
+        if (c >= nchan) {
+            SoapySDR_logf(SOAPY_SDR_ERROR, "setupStream: no such channel: %d", (int)c);
+            conn.rpc->writeInteger(-3);
+            return 0;
+        }
+    }
     // fill out the connection details
     ConnectionInfo &data = s_connections.at(dataId);
     data.dev = conn.dev;
@@ -629,10 +818,19 @@ int handleSetupStream(ConnectionInfo &conn) {
     data.format = fmt;
     data.channels = channels;
     // open the underlying stream
-    data.stream = conn.dev->setupStream(direction, fmt, channels, args);
+    try {
+        data.stream = conn.dev->setupStream(direction, fmt, channels, args);
+    } catch (const std::exception &ex) {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "setupStream: exception: %s", ex.what());
+        data.stream = nullptr;
+    }
     if (!data.stream) {
         SoapySDR_log(SOAPY_SDR_ERROR, "setupStream: failed to create underlying stream");
+        // the data connection is useless now, don't leak it
+        s_connections.erase(dataId);
+        close(dataId);
         conn.rpc->writeInteger(-4);
+        return 0;
     }
     // all good!
     conn.dataIds.insert(dataId);
@@ -659,7 +857,8 @@ int internalCloseStream(ConnectionInfo &conn, int dataId) {
     }
     ConnectionInfo &data = s_connections.at(dataId);
     internalStopPumps(data);
-    data.dev->closeStream(data.stream);
+    if (data.dev && data.stream)
+        data.dev->closeStream(data.stream);
     s_connections.erase(dataId);
     close(dataId);
     conn.dataIds.erase(dataId);
@@ -1063,9 +1262,10 @@ int handleRPC(struct pollfd *pfd, ConnectionInfo &conn) {
     switch (call) {
     // unknown
     default:
-        SoapySDR_logf(SOAPY_SDR_ERROR,"Unknown RPC call: %d", call);
+        // we cannot know how many arguments to skip, so the stream is now out of sync
+        SoapySDR_logf(SOAPY_SDR_ERROR,"Unknown RPC call: %d, dropping connection", call);
         conn.rpc->writeInteger(-1000);
-        return 0;
+        return dropRPC(conn, pfd->fd);
     // special - dropping connection
     case TCPREMOTE_DROP_RPC:
         return dropRPC(conn, pfd->fd);
@@ -1254,85 +1454,218 @@ static void handleLog(const SoapySDRLogLevel level, const char *message) {
 }
 
 int usage() {
-    puts("usage: SoapyTCPServer [-?|--help] [-l <listen host/IP:default *>] [-p <listen port: default 20655>]");
+    puts("usage: SoapyTCPServer [options]\n"
+         "  -l, --listen <host/IP>   address to listen on (default 127.0.0.1, use 0.0.0.0 or :: for all)\n"
+         "  -p, --port <port>        port to listen on (default 20655)\n"
+         "  -b, --buffer-ms <ms>     target network buffering in milliseconds (default: 10 x stream MTU)\n"
+         "  -k, --key <secret>       require clients to present this shared secret\n"
+         "  -K, --key-file <file>    as --key, reading the secret from the first line of a file\n"
+         "                           (the secret may also be given in $SOAPY_TCPREMOTE_KEY)\n"
+         "  -?, --help               show this help\n"
+         "\n"
+         "NB: the secret is sent in clear text and traffic is not encrypted: on untrusted\n"
+         "networks tunnel the port over SSH or a VPN.");
     return 0;
 }
 
-int main(int argc, char **argv) {
-    const char *host = "0.0.0.0";
-    const char *port = "20655";           // 0x50AF ~= SOAP
-    for (int arg=1; arg<argc; ++arg) {
-        if (strncmp(argv[arg],"-?",2)==0 || strncmp(argv[arg],"--h",3)==0)
-            return usage();
-        else if (strncmp(argv[arg],"-h",2)==0)
-            host = argv[++arg];
-        else if (strncmp(argv[arg],"-p",2)==0)
-            port = argv[++arg];
+static bool isLoopback(const std::string &h) {
+    return h=="127.0.0.1" || h=="::1" || h=="localhost";
+}
+
+// create, bind and listen, trying each address returned by the resolver
+static int makeListenSocket(const std::string &host, const char *port) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    // "*" (the old documented wildcard) means every address, both families
+    std::string h = (host=="*")? "::": host;
+    struct addrinfo *res = nullptr;
+    int err = getaddrinfo(h.c_str(), port, &hints, &res);
+    if (err) {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "cannot resolve listen address %s: %s", host.c_str(), gai_strerror(err));
+        return -1;
     }
+    int lsock = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        lsock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (lsock<0)
+            continue;
+        int opt = 1;
+        setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        if (ai->ai_family==AF_INET6) {
+            int off = 0;    // dual stack when listening on ::
+            setsockopt(lsock, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+        }
+        if (bind(lsock, ai->ai_addr, ai->ai_addrlen)==0 && listen(lsock, 16)==0)
+            break;
+        SoapySDR_logf(SOAPY_SDR_WARNING, "listen on %s:%s failed: %s", host.c_str(), port, strerror(errno));
+        close(lsock);
+        lsock = -1;
+    }
+    freeaddrinfo(res);
+    return lsock;
+}
+
+static bool readKeyFile(const char *path, std::string &key) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "SoapyTCPServer: cannot open key file %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    char line[512];
+    bool ok = fgets(line, sizeof(line), fp)!=nullptr;
+    fclose(fp);
+    if (!ok) {
+        fprintf(stderr, "SoapyTCPServer: key file %s is empty\n", path);
+        return false;
+    }
+    key = line;
+    while (!key.empty() && (key.back()=='\n' || key.back()=='\r'))
+        key.pop_back();
+    return true;
+}
+
+int main(int argc, char **argv) {
+    std::string host = "127.0.0.1";
+    const char *port = "20655";           // 0x50AF ~= SOAP
+    if (getenv("SOAPY_TCPREMOTE_KEY"))
+        s_key = getenv("SOAPY_TCPREMOTE_KEY");
+    for (int arg=1; arg<argc; ++arg) {
+        std::string a = argv[arg];
+        // options taking a value
+        bool hasVal = (a=="-l" || a=="--listen" || a=="-h" || a=="-p" || a=="--port" ||
+                       a=="-b" || a=="--buffer-ms" || a=="-k" || a=="--key" || a=="-K" || a=="--key-file");
+        if (a=="-?" || a=="--help")
+            return usage();
+        if (!hasVal) {
+            fprintf(stderr, "SoapyTCPServer: unknown option: %s\n", a.c_str());
+            usage();
+            return 1;
+        }
+        if (arg+1>=argc) {
+            fprintf(stderr, "SoapyTCPServer: option %s needs a value\n", a.c_str());
+            return 1;
+        }
+        const char *val = argv[++arg];
+        if (a=="-l" || a=="--listen")
+            host = val;
+        else if (a=="-h") {     // pre-1.0 spelling, kept for existing scripts
+            fprintf(stderr, "SoapyTCPServer: -h <host> is deprecated, use -l\n");
+            host = val;
+        } else if (a=="-p" || a=="--port")
+            port = val;
+        else if (a=="-b" || a=="--buffer-ms") {
+            s_bufferMs = atoi(val);
+            if (s_bufferMs<0 || s_bufferMs>10000) {
+                fprintf(stderr, "SoapyTCPServer: buffer-ms must be 0..10000\n");
+                return 1;
+            }
+        } else if (a=="-k" || a=="--key")
+            s_key = val;
+        else if (a=="-K" || a=="--key-file") {
+            if (!readKeyFile(val, s_key))
+                return 1;
+        }
+    }
+    // writing to a peer that has gone away must give EPIPE, not kill the server
+    signal(SIGPIPE, SIG_IGN);
     // Detect current log level - shenannigans required as we cannot simply read the value
     s_defaultLogLevel = detectLogLevel();
     printf("SoapyTCPServer: log level=%d\n", (int)s_defaultLogLevel);
     // Now collect all log levels, we filter per-client ourselves
     SoapySDR_registerLogHandler(handleLog);
     SoapySDR_setLogLevel(SOAPY_SDR_TRACE);
-    printf("SoapyTCPServer: listening on: %s:%s\n", host, port);
+    if (s_key.empty() && !isLoopback(host))
+        SoapySDR_logf(SOAPY_SDR_WARNING,
+            "listening on %s with no key: anyone who can reach this port can use your SDR (see --key)", host.c_str());
+    printf("SoapyTCPServer: listening on: %s:%s%s\n", host.c_str(), port, s_key.empty()? "": " (key required)");
     // Set up listen socket
-    struct addrinfo *res = nullptr;
-    if (getaddrinfo(host, port, nullptr, &res)) {
-        SoapySDR_logf(SOAPY_SDR_ERROR,"parsing listen host");
-        return 1;
-    }
-    int lsock = socket(AF_INET, SOCK_STREAM, 0);
-    int opt=1;
-    setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(int));
-    if (lsock<0 || bind(lsock, res->ai_addr, res->ai_addrlen)!=0) {
-        SoapySDR_logf(SOAPY_SDR_ERROR,"binding listen socket");
+    int lsock = makeListenSocket(host, port);
+    if (lsock<0) {
+        SoapySDR_log(SOAPY_SDR_ERROR, "unable to create listen socket");
         return 2;
     }
-    listen(lsock, 5);
-    freeaddrinfo(res);
     // Wait for connections / requests on RPC sockets
+    enum Kind { LISTEN, PENDING, CONN };
+    struct Slot { int fd; Kind kind; };
     while (true) {
-        // allocate maximum possible number of pollfds, then omit data stream connections
-        size_t nfds = s_connections.size()+1;
-        struct pollfd pfds[nfds];
-        pfds[0].fd = lsock;
-        pfds[0].events = POLLIN;
-        pfds[0].revents = 0;
-        nfds = 1;
-        for (auto it=s_connections.begin(); it!=s_connections.end(); ++it) {
-            if (it->second.rpc || it->second.log) {  // RPC or LOG connection
-                pfds[nfds].fd = it->first;
-                pfds[nfds].events = POLLIN;
-                pfds[nfds].revents = 0;
-                ++nfds;
+        // one poll entry for the listen socket, each unidentified connection, and each RPC/LOG connection;
+        // data stream connections are driven by their own threads
+        std::vector<struct pollfd> pfds;
+        std::vector<Slot> slots;
+        pfds.push_back({lsock, POLLIN, 0});
+        slots.push_back({lsock, LISTEN});
+        for (auto &kv : s_pending) {
+            pfds.push_back({kv.first, POLLIN, 0});
+            slots.push_back({kv.first, PENDING});
+        }
+        for (auto &kv : s_connections) {
+            if (kv.second.rpc || kv.second.log) {
+                pfds.push_back({kv.first, POLLIN, 0});
+                slots.push_back({kv.first, CONN});
             }
         }
-        if (poll(pfds, nfds, -1)<=0) {
-            SoapySDR_logf(SOAPY_SDR_ERROR,"waiting for input");
-            return 3;
-        }
-        // Handle listen socket events
-        if (pfds[0].revents && handleListen(pfds)<0)
+        // wake up regularly so we can expire stale connections
+        int pr = poll(pfds.data(), pfds.size(), 1000);
+        if (pr<0) {
+            if (errno==EINTR)
+                continue;
+            SoapySDR_logf(SOAPY_SDR_ERROR,"waiting for input: %s", strerror(errno));
             break;
-        // Handle RPC or LOG socket events
-        for (size_t idx=1; idx<nfds; ++idx) {
-            if (pfds[idx].revents) {
-                ConnectionInfo &ci = s_connections.at(pfds[idx].fd);
-                if (ci.rpc) {
-                    if (handleRPC(pfds+idx, ci)<0)
-                        return 4;
-                }
-                if (ci.log) {
-                    // any input or error on log stream means we're done
-                    fclose(ci.log);
-                    s_connections.erase(pfds[idx].fd);
-                    SoapySDR_logf(SOAPY_SDR_INFO, "log stream closed: %d", pfds[idx].fd);
-                }
+        }
+        expireConnections();
+        if (pr==0)
+            continue;
+        // Handle listen socket events
+        if (pfds[0].revents) {
+            if (pfds[0].revents & (POLLERR|POLLHUP|POLLNVAL)) {
+                SoapySDR_log(SOAPY_SDR_ERROR,"EOF or error in listen socket");
+                break;
+            }
+            acceptConnection(lsock);
+        }
+        // Handle everything else. Handlers may remove connections, so look each one up afresh.
+        for (size_t idx=1; idx<pfds.size(); ++idx) {
+            if (!pfds[idx].revents)
+                continue;
+            int fd = slots[idx].fd;
+            if (PENDING==slots[idx].kind) {
+                if (pfds[idx].revents & (POLLERR|POLLNVAL))
+                    dropPending(fd);
+                else
+                    handlePending(fd);       // also copes with HUP (read returns 0)
+                continue;
+            }
+            auto it = s_connections.find(fd);
+            if (it==s_connections.end())
+                continue;
+            ConnectionInfo &ci = it->second;
+            if (ci.rpc) {
+                int r = handleRPC(&pfds[idx], ci);
+                // a failed handler (or failed socket) only costs us that client
+                it = s_connections.find(fd);
+                if (it!=s_connections.end() && it->second.rpc && (r<0 || it->second.rpc->failed()))
+                    dropRPC(it->second, fd);
+            } else if (ci.log) {
+                // any input or error on log stream means we're done
+                fclose(ci.log);
+                s_connections.erase(fd);
+                SoapySDR_logf(SOAPY_SDR_INFO, "log stream closed: %d", fd);
             }
         }
     }
-    s_connections.clear();
+    // orderly shutdown: release devices
+    while (!s_connections.empty()) {
+        auto it = s_connections.begin();
+        if (it->second.rpc)
+            dropRPC(it->second, it->first);
+        else
+            s_connections.erase(it);
+    }
+    for (auto &kv : s_pending)
+        close(kv.first);
     close(lsock);
     return 0;
 }

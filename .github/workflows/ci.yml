@@ -1,0 +1,37 @@
+name: build-and-test
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libsoapysdr-dev
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j
+      - name: Test (loopback against a fake SDR)
+        run: ctest --test-dir build --output-on-failure
+
+  debian-stable:
+    runs-on: ubuntu-latest
+    container: debian:stable
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: apt-get update && apt-get install -y cmake g++ libsoapysdr-dev
+      - name: Build and test
+        run: |
+          cmake -B build
+          cmake --build build -j
+          ctest --test-dir build --output-on-failure
