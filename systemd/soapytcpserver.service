@@ -1,0 +1,27 @@
+# Run SoapyTCPServer at boot and restart it if it ever dies.
+#
+#   sudo cp systemd/soapytcpserver.service /etc/systemd/system/
+#   sudo cp systemd/soapytcpserver.default /etc/default/soapytcpserver
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now soapytcpserver
+#
+# Edit /etc/default/soapytcpserver to choose the listen address, key etc.
+[Unit]
+Description=SoapyTCPServer - SoapySDR devices over TCP
+After=network.target
+
+[Service]
+EnvironmentFile=-/etc/default/soapytcpserver
+ExecStart=/usr/local/bin/SoapyTCPServer $SOAPYTCPSERVER_OPTS
+Restart=on-failure
+RestartSec=2
+# unprivileged, but allowed to open USB SDRs (group name varies by distribution)
+DynamicUser=yes
+SupplementaryGroups=plugdev
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
