@@ -8,8 +8,13 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <errno.h>
+#include <poll.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <vector>
+#include <algorithm>
 
 // declare the contents of a Stream object for ourselves
 class SoapySDR::Stream
@@ -20,20 +25,30 @@ public:
     int numChans;
     size_t fSize;
     bool running;
+    // receive staging buffer, and how many bytes of it are valid (always less than
+    // one whole frame between calls: the tail of a frame split across TCP reads)
+    std::vector<uint8_t> rxbuf;
+    size_t rxhave = 0;
+    // transmit staging buffer
+    std::vector<uint8_t> txbuf;
 };
 
-SoapyTCPRemote::SoapyTCPRemote(const std::string &address, const std::string &port, const std::string &remdriver, const std::string &remargs) :
+SoapyTCPRemote::SoapyTCPRemote(const std::string &address, const std::string &port, const std::string &remdriver, const std::string &remargs, const std::string &remkey) :
     remoteAddress(address),
     remotePort(port),
     remoteDriver(remdriver),
-    remoteArgs(remargs)
+    remoteArgs(remargs),
+    remoteKey(remkey),
+    rpc(nullptr),
+    log(nullptr),
+    logId(0)
 {
     SoapySDR_logf(SOAPY_SDR_TRACE, "SoapyTCPRemote::<cons>(%s,%s,%s,%s)",
         address.c_str(), port.c_str(), remdriver.c_str(), remargs.c_str());
     int status = connectLogStream(detectLogLevel());
     if (status<0)
         throw std::runtime_error("unable to connect log stream");
-    int sock = connect();
+    int sock = connect(true);
     if (sock<0)
         throw std::runtime_error("unable to connect to remote");
     rpc = new SoapyRPC(sock);
@@ -53,38 +68,60 @@ SoapyTCPRemote::~SoapyTCPRemote()
     }
     if (log) {
         // writing to this stream terminates it via the remote end
-        write(fileno(log), "\n", 1);
+        if (write(fileno(log), "\n", 1)<0)
+            SoapySDR_logf(SOAPY_SDR_DEBUG, "SoapyTCPRemote::<dest>, log stream: %s", strerror(errno));
         logThread.join();
     }
 }
 
+std::string SoapyTCPRemote::typeLine(int type) const
+{
+    std::string line = std::to_string(type);
+    if (!remoteKey.empty())
+        line += ":" + remoteKey;
+    return line;
+}
+
 // private connector method
-int SoapyTCPRemote::connect() const
+int SoapyTCPRemote::connect(bool lowLatency) const
 {
     SoapySDR_log(SOAPY_SDR_TRACE, "SoapyTCPRemote::connect()");
-    // create new socket
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        SoapySDR_logf(SOAPY_SDR_ERROR, "Unable to create socket: %s", strerror(errno));
-        return -1;
-    }
-    // resolve address (or parse)
+    // resolve address (IPv4 or IPv6, name or literal)
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
     struct addrinfo *res = nullptr;
-    if (getaddrinfo(remoteAddress.c_str(), remotePort.c_str(), nullptr, &res)) {
+    int err = getaddrinfo(remoteAddress.c_str(), remotePort.c_str(), &hints, &res);
+    if (err) {
         SoapySDR_logf(SOAPY_SDR_ERROR, "Failed to resolve address/port: %s/%s: %s",
-            remoteAddress.c_str(), remotePort.c_str(), strerror(errno));
-        close(sock);
+            remoteAddress.c_str(), remotePort.c_str(), gai_strerror(err));
         return -1;
     }
-    // attempt connection to remote server
-    if (::connect(sock, res->ai_addr, res->ai_addrlen)) {
-        SoapySDR_logf(SOAPY_SDR_ERROR, "Failed to connect to address/port: %s/%s: %s",
-            remoteAddress.c_str(), remotePort.c_str(), strerror(errno));
-        freeaddrinfo(res);
+    // attempt connection to remote server, trying each address in turn
+    int sock = -1;
+    int lasterr = 0;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (sock < 0) {
+            lasterr = errno;
+            continue;
+        }
+        if (::connect(sock, ai->ai_addr, ai->ai_addrlen)==0)
+            break;
+        lasterr = errno;
         close(sock);
-        return -1;
+        sock = -1;
     }
     freeaddrinfo(res);
+    if (sock < 0) {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "Failed to connect to address/port: %s/%s: %s",
+            remoteAddress.c_str(), remotePort.c_str(), strerror(lasterr));
+        return -1;
+    }
+    // small request/response traffic wants low latency, bulk data does not
+    if (lowLatency)
+        soapyNoDelay(sock);
     SoapySDR_logf(SOAPY_SDR_DEBUG, "SoapyTCPRemote: connected: %s/%s",
             remoteAddress.c_str(), remotePort.c_str());
     return sock;
@@ -94,7 +131,7 @@ int SoapyTCPRemote::loadRemoteDriver() const
 {
     SoapySDR_log(SOAPY_SDR_TRACE, "SoapyTCPRemote::loadRemoteDriver()");
     // identify this connection as an RPC stream load the remote driver
-    rpc->writeInteger(TCPREMOTE_RPC_LOAD);
+    rpc->writeString(typeLine(TCPREMOTE_RPC_LOAD));
     rpc->writeString(remoteDriver);
     rpc->writeString(remoteArgs);
     return rpc->readInteger();
@@ -104,17 +141,18 @@ int SoapyTCPRemote::connectLogStream(SoapySDRLogLevel level)
 {
     SoapySDR_log(SOAPY_SDR_TRACE, "SoapyTCPRemote::connectLogStream");
     // first connect a new socket
-    int sock = connect();
+    int sock = connect(true);
     if (sock<0)
         return sock;
     log = fdopen(sock, "r+");
     if (!log) {
+        close(sock);
         SoapySDR_logf(SOAPY_SDR_ERROR, "fdopen() log stream: %s", strerror(errno));
         return -1;
     }
     setlinebuf(log);
     // identify this as the log stream, set level, obtain remote handle
-    fprintf(log, "%d\n%d\n", TCPREMOTE_LOG_STREAM, (int)level);
+    fprintf(log, "%s\n%d\n", typeLine(TCPREMOTE_LOG_STREAM).c_str(), (int)level);
     char ret[10];
     if (!fgets(ret, sizeof(ret), log)) {
         SoapySDR_logf(SOAPY_SDR_ERROR, "fgets() log identifier: %s", strerror(errno));
@@ -288,21 +326,22 @@ SoapySDR::Stream *SoapyTCPRemote::setupStream(const int direction, const std::st
     // in order to help the remote side associate the data stream with the setup call,
     // we create the data connection *first*, then send it's remoteId as the first
     // parameter to the RPC call..
-    int data = connect();
+    int data = connect(false);
     if (data<0) {
         SoapySDR_log(SOAPY_SDR_ERROR, "SoapyTCPRemote::setupStream, data stream failed to connect");
         return nullptr;
     }
     // sending one of TCPREMOTE_DATA_<x> makes this a data stream in the remote
-    char dir[10];
-    int dlen = sprintf(dir, "%d\n", SOAPY_SDR_RX==direction? TCPREMOTE_DATA_SEND : TCPREMOTE_DATA_RECV);
-    if (write(data, dir, dlen)!=dlen) {
+    char dir[16];
+    int dlen;
+    std::string dline = typeLine(SOAPY_SDR_RX==direction? TCPREMOTE_DATA_SEND : TCPREMOTE_DATA_RECV) + "\n";
+    if (write(data, dline.c_str(), dline.length())!=(ssize_t)dline.length()) {
         SoapySDR_logf(SOAPY_SDR_ERROR, "SoapyTCPRemote::setupStream, failed to write data stream type: %s",
             strerror(errno));
         close(data);
         return nullptr;
     }
-    dlen = read(data, dir, sizeof(dir));
+    dlen = read(data, dir, sizeof(dir) - 1);
     if (dlen<=0) {
         SoapySDR_logf(SOAPY_SDR_ERROR, "SoapyTCPRemote::setupStream, failed to read data stream remoteId: %s",
             strerror(errno));
@@ -420,36 +459,64 @@ int SoapyTCPRemote::readStream(SoapySDR::Stream *stream,
     if (!stream->running)
         return SOAPY_SDR_TIMEOUT;
     // Transfer format on the wire is interleaved sample frames (each fSize) across channels.
-    // We read by making one syscall for the maximum amount, then de-interleaving and possibly
-    // converting formats into buffs.
-    size_t blkSize = stream->fSize * stream->numChans;
-    uint8_t *swamp = (uint8_t *)alloca(blkSize * numElems);
-    int status = read(stream->netSock, swamp, blkSize*numElems);
-    if (status<=0) {
-        SoapySDR_logf(SOAPY_SDR_ERROR, "SoapyTCPRemote::readStream, error reading data: %s", strerror(errno));
-        return SOAPY_SDR_STREAM_ERROR;
+    // TCP gives us a byte stream, so a read may end part way through a frame: we keep
+    // the partial tail for the next call. Then we de-interleave and possibly convert
+    // formats into buffs.
+    const size_t blkSize = stream->fSize * stream->numChans;
+    if (numElems==0 || blkSize==0)
+        return 0;
+    const size_t want = blkSize * numElems;
+    if (stream->rxbuf.size() < want)
+        stream->rxbuf.resize(want);
+    uint8_t *swamp = stream->rxbuf.data();
+    // wait (up to the timeout) until we hold at least one whole frame
+    while (stream->rxhave < blkSize) {
+        struct pollfd pfd = { stream->netSock, POLLIN, 0 };
+        int pr = poll(&pfd, 1, timeoutUs>0? (int)((timeoutUs+999)/1000): 0);
+        if (pr==0)
+            return SOAPY_SDR_TIMEOUT;
+        if (pr<0) {
+            if (errno==EINTR)
+                continue;
+            SoapySDR_logf(SOAPY_SDR_ERROR, "SoapyTCPRemote::readStream, error waiting for data: %s", strerror(errno));
+            return SOAPY_SDR_STREAM_ERROR;
+        }
+        ssize_t n = read(stream->netSock, swamp + stream->rxhave, want - stream->rxhave);
+        if (n==0) {
+            SoapySDR_log(SOAPY_SDR_ERROR, "SoapyTCPRemote::readStream, remote closed the data connection");
+            return SOAPY_SDR_STREAM_ERROR;
+        }
+        if (n<0) {
+            if (errno==EINTR || errno==EAGAIN)
+                continue;
+            SoapySDR_logf(SOAPY_SDR_ERROR, "SoapyTCPRemote::readStream, error reading data: %s", strerror(errno));
+            return SOAPY_SDR_STREAM_ERROR;
+        }
+        stream->rxhave += n;
     }
-    status /= stream->fSize;
-    int elems=0;
-    int soff=0;
-    int boff=0;
-    int bSize=stream->fSize;
+    const size_t elems = stream->rxhave / blkSize;
+    size_t soff=0;
+    size_t boff=0;
+    size_t bSize=stream->fSize;
     void *(*cnv)(void *, const void *, size_t) = memcpy;
     if (fmtout!=fmtwire) {
         bSize = g_frameSizes.at(fmtout);
         // TODO: actually check these formats =)
         cnv = convertCS16toCF32;
     }
-    while (elems<status) {
+    for (size_t e=0; e<elems; ++e) {
         for (int c=0; c<stream->numChans; ++c) {
             uint8_t *buf = (uint8_t *)(buffs[c]);
             cnv(buf+boff, swamp+soff, stream->fSize);
             soff += stream->fSize;
         }
         boff += bSize;
-        ++elems;
     }
-    return elems;
+    // keep any partial frame for next time
+    stream->rxhave -= elems * blkSize;
+    if (stream->rxhave)
+        memmove(swamp, swamp + elems * blkSize, stream->rxhave);
+    return (int)elems;
 }
 
 int SoapyTCPRemote::writeStream(SoapySDR::Stream *stream,
@@ -463,27 +530,35 @@ int SoapyTCPRemote::writeStream(SoapySDR::Stream *stream,
     // Not running? timeout (says the docs)
     if (!stream->running)
         return SOAPY_SDR_TIMEOUT;
-    // allocate buffer for a set of interleaved channels
-    size_t bufSize = stream->fSize * stream->numChans;
-    uint8_t *nbuf = (uint8_t *)alloca(bufSize);
-    // assemble interleaved buffer for each element and write to network via stdio buffering/TCP back pressure
-    size_t elems=0;
-    int noff=0;
-    int boff=0;
-    while (elems<numElems) {
+    // assemble all elements as interleaved frames, then write the lot with as
+    // few syscalls as possible (TCP back pressure blocks us if the server is slow)
+    const size_t blkSize = stream->fSize * stream->numChans;
+    const size_t total = blkSize * numElems;
+    if (total==0)
+        return 0;
+    if (stream->txbuf.size() < total)
+        stream->txbuf.resize(total);
+    uint8_t *out = stream->txbuf.data();
+    size_t noff=0;
+    for (size_t e=0; e<numElems; ++e) {
         for (int c=0; c<stream->numChans; ++c) {
-            uint8_t *buf = (uint8_t *)buffs[c];
-            memcpy(nbuf+noff, buf+boff, stream->fSize);
+            memcpy(out+noff, (const uint8_t *)buffs[c] + e*stream->fSize, stream->fSize);
             noff += stream->fSize;
         }
-        boff += stream->fSize;
-        if (write(stream->netSock, nbuf, bufSize)!=(int)bufSize) {
+    }
+    size_t done = 0;
+    while (done < total) {
+        // MSG_NOSIGNAL: a vanished server must not raise SIGPIPE in the host application
+        ssize_t n = send(stream->netSock, out+done, total-done, MSG_NOSIGNAL);
+        if (n<0) {
+            if (errno==EINTR)
+                continue;
             SoapySDR_logf(SOAPY_SDR_ERROR, "SoapyTCPRemote::writeStream, error writing data: %s", strerror(errno));
             break;
         }
-        ++elems;
+        done += n;
     }
-    return (int)elems;
+    return (int)(done / blkSize);
 }
 
 int SoapyTCPRemote::readStreamStatus(
@@ -833,7 +908,7 @@ std::string getConfFile() {
         size_t pos, nxt=-1;
         do {
             pos = nxt+1;
-            size_t nxt = env.find(':', pos);
+            nxt = env.find(':', pos);
             tst = env.substr(pos,nxt-pos);
             tst += "/SoapyTCPRemote.conf";
             if (access(tst.c_str(), R_OK)==0)
@@ -861,17 +936,16 @@ std::string getConfValue(const std::string &key) {
     std::string cf = getConfFile();
     FILE *fp = nullptr;
     if (cf.length()>0 && (fp=fopen(cf.c_str(), "r"))!=nullptr) {
-        char line[80];
+        char line[512];
         while (fgets(line, sizeof(line), fp)) {
             std::string arg = line;
-            if (arg[0]=='#')
+            while (!arg.empty() && (arg.back()=='\n' || arg.back()=='\r'))
+                arg.pop_back();
+            if (arg.empty() || arg[0]=='#')
                 continue;
-            arg = arg.substr(0, arg.length()-1);
-            size_t off = arg.find(key, 0);
-            if (std::string::npos==off)
-                continue;
-            off = arg.find('=', off);
-            if (std::string::npos==off)
+            // exact "name=value" match on the name (previously any line containing it)
+            size_t off = arg.find('=');
+            if (std::string::npos==off || arg.substr(0, off)!=key)
                 continue;
             rv = arg.substr(off+1);
             break;
@@ -907,10 +981,19 @@ SoapySDR::KwargsList findTCPRemote(const SoapySDR::Kwargs &args)
     } else {
         driver = args.at("tcpremote:driver");
     }
-    size_t colon = address.find(':',0);
     // no port, default to 0x50AF (20655)
     int port = 0x50AF;
-    if (colon != (size_t)-1) {
+    if (!address.empty() && address[0]=='[') {
+        // [ipv6]:port or [ipv6]
+        size_t rb = address.find(']');
+        if (rb != std::string::npos) {
+            if (rb+1 < address.length() && address[rb+1]==':')
+                port = atoi(address.substr(rb+2).c_str());
+            address = address.substr(1, rb-1);
+        }
+    } else if (std::count(address.begin(), address.end(), ':')==1) {
+        // host:port (more than one colon is a bare IPv6 address, which has no port)
+        size_t colon = address.find(':');
         port = atoi(address.substr(colon+1).c_str());
         address = address.substr(0, colon);
     }
@@ -937,7 +1020,16 @@ SoapySDR::Device *makeTCPRemote(const SoapySDR::Kwargs &args)
     std::string port = args.at("port");
     std::string remdriver = args.at("tcpremote:driver");
     std::string remargs = args.at("tcpremote:args");
-    return (SoapySDR::Device*) new SoapyTCPRemote(address, port, remdriver, remargs);
+    // shared secret: device args, then environment, then config file. Deliberately not
+    // copied into the enumeration results, so it never shows up in --probe output or logs.
+    std::string remkey;
+    if (args.find("tcpremote:key")!=args.end())
+        remkey = args.at("tcpremote:key");
+    else if (getenv("SOAPY_TCPREMOTE_KEY"))
+        remkey = getenv("SOAPY_TCPREMOTE_KEY");
+    else
+        remkey = getConfValue("key");
+    return (SoapySDR::Device*) new SoapyTCPRemote(address, port, remdriver, remargs, remkey);
 }
 
 /* Register this driver */

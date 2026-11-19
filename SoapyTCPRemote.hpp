@@ -22,11 +22,15 @@ private:
     const std::string remotePort;
     const std::string remoteDriver;
     const std::string remoteArgs;
+    // optional shared secret, sent with each connection type line
+    const std::string remoteKey;
     // requested & wire formats, as we may choose smaller native format
     std::string fmtout;
     std::string fmtwire;
     // network connect
-    int connect() const;
+    int connect(bool lowLatency) const;
+    // first line of every connection: "<type>" or "<type>:<key>"
+    std::string typeLine(int type) const;
     // RPC handler
     SoapyRPC *rpc;
     // Log stream, ID and thread
@@ -38,7 +42,7 @@ private:
     int connectLogStream(SoapySDRLogLevel level);
     static void processLogStream(SoapyTCPRemote *rem);
 public:
-    SoapyTCPRemote(const std::string &address, const std::string &port, const std::string &remdriver, const std::string &remargs);
+    SoapyTCPRemote(const std::string &address, const std::string &port, const std::string &remdriver, const std::string &remargs, const std::string &remkey = std::string());
     ~SoapyTCPRemote();
 
     // Identification API (driver local, others remote)
