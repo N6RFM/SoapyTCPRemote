@@ -181,3 +181,8 @@ in this version are offered under the same licence.
 ## Feedback
 Feel free to raise issues for discussion or problems or features, better yet: submit PRs. As Phil put it in
 the original: "submit PRs to fix my poor code please!"
+
+## Authors
+ * **Phil Ashby** ([phlash](https://github.com/phlash)): original author. Design, protocol, client driver and server.
+ * **N6RFM**: this version's maintainer. Project direction, testing on real hardware (Orange Pi Zero 3 and Airspy One), and release.
+ * **Claude** (Anthropic's AI assistant): code and documentation for the fixes, security changes, tests and CI described above, written with N6RFM.
