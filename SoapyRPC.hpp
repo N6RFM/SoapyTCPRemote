@@ -10,8 +10,28 @@
 // protocols.
 
 #include <stdio.h>
+#include <errno.h>
+#include <math.h>
 #include <cstring>
+#include <map>
+#include <string>
+#include <vector>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <SoapySDR/Types.hpp>
 #include <SoapySDR/Logger.hpp>
+
+// Disable Nagle on a socket. RPC traffic is many small request/response
+// lines, where Nagle + delayed ACK can add ~40ms to every call.
+static inline void soapyNoDelay(int sock) {
+    int one = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+}
+
+// Longest line we will accept from the network (protects against a peer
+// that never sends a newline).
+const size_t TCPREMOTE_MAX_LINE = 65536;
 
 // map of format names to frame sizes
 const std::map<std::string, size_t> g_frameSizes = {
@@ -193,8 +213,9 @@ public:
     }
     int writeDouble(const double d) {
         if (hasError) return -1;
-        SoapySDR_logf(SOAPY_SDR_TRACE, "Wd %f", d);
-        int r = fprintf(handle, "%f\n", d);
+        SoapySDR_logf(SOAPY_SDR_TRACE, "Wd %.17g", d);
+        // %.17g round-trips any double exactly (plain %f kept only 6 decimals)
+        int r = fprintf(handle, "%.17g\n", d);
         if (r<0) {
             SoapySDR_logf(SOAPY_SDR_ERROR, "SoapyRPC::writeDouble %s", strerror(errno));
             hasError = true;
@@ -256,7 +277,7 @@ public:
         return rv;
     }
     double readDouble() {
-        if (hasError) return -1;
+        if (hasError) return NAN;
         double rv=NAN;
         std::string s = readString();
         if (s.length()>0)
@@ -265,17 +286,39 @@ public:
             SoapySDR_log(SOAPY_SDR_ERROR, "SoapyRPC::readDouble, empty line");
         return rv;
     }
+    // Read one line, without its terminating "\n" (or "\r\n").
+    // Lines of any length up to TCPREMOTE_MAX_LINE are supported; EOF, a read
+    // error or an over-long line puts the connection into the error state.
     std::string readString() {
-        char line[256];
         std::string rv;
         if (hasError) return rv;
-        if (fgets(line, sizeof(line), handle)) {
-            line[strlen(line)-1] = 0;
-            rv = line;
-        } else {
-            SoapySDR_logf(SOAPY_SDR_ERROR, "SoapyRPC::readString: %s", strerror(errno));
-            hasError = true;
+        char chunk[256];
+        bool done = false;
+        while (!done) {
+            if (!fgets(chunk, sizeof(chunk), handle)) {
+                if (feof(handle))
+                    SoapySDR_log(SOAPY_SDR_DEBUG, "SoapyRPC::readString: EOF");
+                else
+                    SoapySDR_logf(SOAPY_SDR_ERROR, "SoapyRPC::readString: %s", strerror(errno));
+                hasError = true;
+                rv.clear();
+                return rv;
+            }
+            size_t n = strlen(chunk);
+            if (n>0 && chunk[n-1]=='\n') {
+                chunk[--n] = 0;
+                done = true;
+            }
+            rv.append(chunk, n);
+            if (rv.length()>TCPREMOTE_MAX_LINE) {
+                SoapySDR_log(SOAPY_SDR_ERROR, "SoapyRPC::readString: line too long");
+                hasError = true;
+                rv.clear();
+                return rv;
+            }
         }
+        if (!rv.empty() && rv.back()=='\r')
+            rv.pop_back();
         SoapySDR_logf(SOAPY_SDR_TRACE, "R '%s'", rv.c_str());
         return rv;
     }
@@ -287,7 +330,7 @@ public:
             if (nv.length()<2)      // '=' or empty is a terminator
                 break;
             size_t p = nv.find('=');
-            if (p>0) {
+            if (p!=std::string::npos && p>0) {
                 args[nv.substr(0,p)] = nv.substr(p+1);
             } else {
                 SoapySDR_logf(SOAPY_SDR_INFO,"SoapyRPC::readKwargs, ignored invalid line: %s", nv.c_str());
@@ -307,6 +350,9 @@ public:
         }
         return list;
     }
+
+    // true once any I/O has failed; no further I/O is attempted
+    bool failed() const { return hasError; }
 
 private:
     FILE *handle;
